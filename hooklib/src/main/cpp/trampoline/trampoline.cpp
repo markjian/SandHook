@@ -5,7 +5,7 @@
 #ifndef SANDHOOK_TRAMPOLINE_CPP
 #define SANDHOOK_TRAMPOLINE_CPP
 
-#include "trampoline.h"
+#include "../includes/trampoline.h"
 
 namespace SandHook {
 
@@ -82,6 +82,10 @@ namespace SandHook {
 
         void setOriginCode(Code originCode) {
             codeCopy(originCode, OFFSET_INLINE_ORIGIN_CODE, SIZE_DIRECT_JUMP_TRAMPOLINE);
+        }
+
+        void setOriginCode(Code originCode, Size codeLen) {
+            codeCopy(originCode, OFFSET_INLINE_ORIGIN_CODE, codeLen);
         }
 
         Code getCallOriginCode() {

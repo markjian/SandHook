@@ -1,20 +1,104 @@
 //
 // Created by swift on 2019/1/20.
 //
-#include "trampoline_manager.h"
-#include "trampoline.h"
+#include "../includes/trampoline_manager.h"
+#include "../includes/trampoline.h"
+#include "../includes/inst.h"
+#include "../includes/log.h"
+
+extern int SDK_INT;
+#define SWITCH_SETX0 true
 
 namespace SandHook {
 
+
+    uint32_t TrampolineManager::sizeOfEntryCode(mirror::ArtMethod *method) {
+        Code codeEntry = getEntryCode(method);
+        #if defined(__arm__)
+        if (isThumbCode(reinterpret_cast<Size>(codeEntry))) {
+            codeEntry = getThumbCodeAddress(codeEntry);
+        }
+        #endif
+        uint32_t size = *reinterpret_cast<uint32_t *>((Size)codeEntry - 4);
+        return size;
+    }
+
+    class PCRelatedCheckVisitor : public InstVisitor {
+    public:
+
+        bool pcRelated = false;
+        bool canSafeBackup = true;
+
+        int instSize = 0;
+
+        TrampolineManager* trampolineManager;
+
+        PCRelatedCheckVisitor(TrampolineManager* t) {
+            trampolineManager = t;
+        }
+
+        bool visit(Inst *inst, Size offset, Size length) override {
+
+            instSize += inst->instLen();
+
+            if (inst->pcRelated()) {
+                LOGW("found pc related inst: %x !", inst->bin());
+                if (trampolineManager->inlineSecurityCheck) {
+                    pcRelated = true;
+                    return false;
+                }
+            }
+
+            if (instSize > SIZE_ORIGIN_PLACE_HOLDER) {
+                canSafeBackup = false;
+            }
+
+            return true;
+        }
+    };
+
+    class InstSizeNeedBackupVisitor : public InstVisitor {
+    public:
+
+        Size instSize = 0;
+
+        bool visit(Inst *inst, Size offset, Size length) override {
+            instSize += inst->instLen();
+            return true;
+        }
+    };
+
+    bool TrampolineManager::canSafeInline(mirror::ArtMethod *method) {
+
+        if (skipAllCheck)
+            return true;
+
+        //check size
+        if (!method->isNative()) {
+            uint32_t originCodeSize = sizeOfEntryCode(method);
+            if (originCodeSize < SIZE_DIRECT_JUMP_TRAMPOLINE) {
+                LOGW("can not inline due to origin code is too small(size is %d)", originCodeSize);
+                return false;
+            }
+        }
+
+        //check pc relate inst & backup inst len
+        PCRelatedCheckVisitor visitor(this);
+
+        InstDecode::decode(method->getQuickCodeEntry(), SIZE_DIRECT_JUMP_TRAMPOLINE, &visitor);
+
+        return (!visitor.pcRelated) && visitor.canSafeBackup;
+    }
+
     Code TrampolineManager::allocExecuteSpace(Size size) {
-        if (size > MMAP_PAGE_SIZE)
+        if (size > EXE_BLOCK_SIZE)
             return 0;
         AutoLock autoLock(allocSpaceLock);
         void* mmapRes;
         Code exeSpace = 0;
         if (executeSpaceList.size() == 0) {
             goto label_alloc_new_space;
-        } else if (executePageOffset + size > MMAP_PAGE_SIZE) {
+        } else if (executePageOffset + size > EXE_BLOCK_SIZE) {
             goto label_alloc_new_space;
         } else {
             exeSpace = executeSpaceList.back();
@@ -23,11 +107,12 @@ namespace SandHook {
             return retSpace;
         }
     label_alloc_new_space:
-        mmapRes = mmap(NULL, MMAP_PAGE_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC,
+        mmapRes = mmap(NULL, EXE_BLOCK_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC,
                              MAP_ANON | MAP_PRIVATE, -1, 0);
         if (mmapRes == MAP_FAILED) {
             return 0;
         }
+        memset(mmapRes, 0, EXE_BLOCK_SIZE);
         exeSpace = static_cast<Code>(mmapRes);
         executeSpaceList.push_back(exeSpace);
         executePageOffset = size;
@@ -43,17 +128,39 @@ namespace SandHook {
             return getHookTrampoline(originMethod);
         HookTrampoline* hookTrampoline = new HookTrampoline();
         ReplacementHookTrampoline* replacementHookTrampoline = nullptr;
+        CallOriginTrampoline* callOriginTrampoline = nullptr;
         Code replacementHookTrampolineSpace;
+        Code callOriginTrampolineSpace;
 
         replacementHookTrampoline = new ReplacementHookTrampoline();
         replacementHookTrampoline->init();
         replacementHookTrampolineSpace = allocExecuteSpace(replacementHookTrampoline->getCodeLen());
-        if (replacementHookTrampolineSpace == 0)
+        if (replacementHookTrampolineSpace == 0) {
+            LOGE("hook error due to can not alloc execute space!");
             goto label_error;
+        }
         replacementHookTrampoline->setExecuteSpace(replacementHookTrampolineSpace);
         replacementHookTrampoline->setEntryCodeOffset(quickCompileOffset);
         replacementHookTrampoline->setHookMethod(reinterpret_cast<Code>(hookMethod));
         hookTrampoline->replacement = replacementHookTrampoline;
+        hookTrampoline->originCode = static_cast<Code>(originMethod->getQuickCodeEntry());
+
+        if (SWITCH_SETX0 && SDK_INT >= ANDROID_O && backupMethod != nullptr) {
+            callOriginTrampoline = new CallOriginTrampoline();
+            checkThumbCode(callOriginTrampoline, getEntryCode(originMethod));
+            callOriginTrampoline->init();
+            callOriginTrampolineSpace = allocExecuteSpace(callOriginTrampoline->getCodeLen());
+            if (callOriginTrampolineSpace == 0)
+                goto label_error;
+            callOriginTrampoline->setExecuteSpace(callOriginTrampolineSpace);
+            callOriginTrampoline->setOriginMethod(reinterpret_cast<Code>(originMethod));
+            Code originCode = getEntryCode(originMethod);
+            if (callOriginTrampoline->isThumbCode()) {
+                originCode = callOriginTrampoline->getThumbCodePcAddress(originCode);
+            }
+            callOriginTrampoline->setOriginCode(originCode);
+            hookTrampoline->callOrigin = callOriginTrampoline;
+        }
 
         trampolines[originMethod] = hookTrampoline;
         return hookTrampoline;
@@ -61,6 +168,8 @@ namespace SandHook {
     label_error:
         delete hookTrampoline;
         delete replacementHookTrampoline;
+        if (callOriginTrampoline != nullptr)
+            delete callOriginTrampoline;
         return nullptr;
     }
 
@@ -79,22 +188,29 @@ namespace SandHook {
         Code inlineHookTrampolineSpace;
         Code callOriginTrampolineSpace;
         Code originEntry;
+        Size sizeNeedBackup = SIZE_DIRECT_JUMP_TRAMPOLINE;
+        InstSizeNeedBackupVisitor instVisitor;
+
+        InstDecode::decode(originMethod->getQuickCodeEntry(), SIZE_DIRECT_JUMP_TRAMPOLINE, &instVisitor);
+        sizeNeedBackup = instVisitor.instSize;
 
         //生成二段跳板
         inlineHookTrampoline = new InlineHookTrampoline();
         checkThumbCode(inlineHookTrampoline, getEntryCode(originMethod));
         inlineHookTrampoline->init();
         inlineHookTrampolineSpace = allocExecuteSpace(inlineHookTrampoline->getCodeLen());
-        if (inlineHookTrampolineSpace == 0)
+        if (inlineHookTrampolineSpace == 0) {
+            LOGE("hook error due to can not alloc execute space!");
             goto label_error;
+        }
         inlineHookTrampoline->setExecuteSpace(inlineHookTrampolineSpace);
         inlineHookTrampoline->setEntryCodeOffset(quickCompileOffset);
         inlineHookTrampoline->setOriginMethod(reinterpret_cast<Code>(originMethod));
         inlineHookTrampoline->setHookMethod(reinterpret_cast<Code>(hookMethod));
         if (inlineHookTrampoline->isThumbCode()) {
-            inlineHookTrampoline->setOriginCode(inlineHookTrampoline->getThumbCodeAddress(getEntryCode(originMethod)));
+            inlineHookTrampoline->setOriginCode(inlineHookTrampoline->getThumbCodeAddress(getEntryCode(originMethod)), sizeNeedBackup);
         } else {
-            inlineHookTrampoline->setOriginCode(getEntryCode(originMethod));
+            inlineHookTrampoline->setOriginCode(getEntryCode(originMethod), sizeNeedBackup);
         }
         hookTrampoline->inlineSecondory = inlineHookTrampoline;
 
@@ -104,6 +220,7 @@ namespace SandHook {
         directJumpTrampoline->init();
         originEntry = getEntryCode(originMethod);
         if (!memUnprotect(reinterpret_cast<Size>(originEntry), directJumpTrampoline->getCodeLen())) {
+            LOGE("hook error due to can not write origin code!");
             goto label_error;
         }
 
@@ -121,21 +238,23 @@ namespace SandHook {
             checkThumbCode(callOriginTrampoline, getEntryCode(originMethod));
             callOriginTrampoline->init();
             callOriginTrampolineSpace = allocExecuteSpace(callOriginTrampoline->getCodeLen());
-            if (callOriginTrampolineSpace == 0)
+            if (callOriginTrampolineSpace == 0) {
+
                 goto label_error;
+            }
             callOriginTrampoline->setExecuteSpace(callOriginTrampolineSpace);
             callOriginTrampoline->setOriginMethod(reinterpret_cast<Code>(originMethod));
             Code originCode = nullptr;
             if (callOriginTrampoline->isThumbCode()) {
                 originCode = callOriginTrampoline->getThumbCodePcAddress(inlineHookTrampoline->getCallOriginCode());
                 #if defined(__arm__)
-                Code originRemCode = callOriginTrampoline->getThumbCodePcAddress(originEntry + directJumpTrampoline->getCodeLen());
+                Code originRemCode = callOriginTrampoline->getThumbCodePcAddress(originEntry + sizeNeedBackup);
                 Size offset = originRemCode - getEntryCode(originMethod);
                 if (offset != directJumpTrampoline->getCodeLen()) {
                     Code32Bit offset32;
                     offset32.code = offset;
-                    unsigned char offsetOP = callOriginTrampoline->isBigEnd() ? offset32.op.op2 : offset32.op.op1;
-                    callOriginTrampoline->tweakOpImm(OFFSET_INLINE_OP_ORIGIN_OFFSET_CODE, offsetOP);
+                    uint8_t offsetOP = callOriginTrampoline->isBigEnd() ? offset32.op.op4 : offset32.op.op1;
+                    inlineHookTrampoline->tweakOpImm(OFFSET_INLINE_OP_ORIGIN_OFFSET_CODE, offsetOP);
                 }
                 #endif
             } else {
@@ -144,7 +263,6 @@ namespace SandHook {
             callOriginTrampoline->setOriginCode(originCode);
             hookTrampoline->callOrigin = callOriginTrampoline;
         }
-
         trampolines[originMethod] = hookTrampoline;
         return hookTrampoline;
 

@@ -1,17 +1,34 @@
 package com.swift.sandhook;
 
 import android.os.Build;
+import android.util.Log;
 
+import com.swift.sandhook.annotation.HookMode;
+import com.swift.sandhook.utils.Unsafe;
 import com.swift.sandhook.wrapper.HookErrorException;
 import com.swift.sandhook.wrapper.HookWrapper;
 
-import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Member;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class SandHook {
+
+    static Map<Member,HookWrapper.HookEntity> globalHookEntityMap = new ConcurrentHashMap<>();
+    static Map<Method,HookWrapper.HookEntity> globalBackupMap = new ConcurrentHashMap<>();
+
+    private static HookModeCallBack hookModeCallBack;
+    public static void setHookModeCallBack(HookModeCallBack hookModeCallBack) {
+        SandHook.hookModeCallBack = hookModeCallBack;
+    }
+
+    private static HookResultCallBack hookResultCallBack;
+    public static void setHookResultCallBack(HookResultCallBack hookResultCallBack) {
+        SandHook.hookResultCallBack = hookResultCallBack;
+    }
 
     public static Class artMethodClass;
 
@@ -24,7 +41,11 @@ public class SandHook {
     public static int testAccessFlag;
 
     static {
-        System.loadLibrary("native-lib");
+        if (SandHookConfig.libSandHookPath == null || SandHookConfig.libSandHookPath.length() == 0) {
+            System.loadLibrary("sandhook");
+        } else {
+            System.load(SandHookConfig.libSandHookPath);
+        }
         init();
     }
 
@@ -47,33 +68,150 @@ public class SandHook {
         HookWrapper.addHookClass(hookWrapperClass);
     }
 
-    public static boolean hook(Member target, Method hook, Method backup) {
+    public static void addHookClass(ClassLoader classLoader, Class... hookWrapperClass) throws HookErrorException {
+        HookWrapper.addHookClass(classLoader, hookWrapperClass);
+    }
+
+    public static synchronized void hook(HookWrapper.HookEntity entity) throws HookErrorException {
+
+        if (entity == null)
+            throw new HookErrorException("null hook entity");
+
+        Member target = entity.target;
+        Method hook = entity.hook;
+        Method backup = entity.backup;
+
         if (target == null || hook == null)
-            return false;
+            throw new HookErrorException("null input");
+
+        if (globalHookEntityMap.containsKey(entity.target))
+            throw new HookErrorException("method <" + entity.target.getName() + "> has been hooked!");
+
         resolveStaticMethod(target);
-        if (backup != null) {
-            resolveStaticMethod(backup);
+        resolveStaticMethod(backup);
+        if (backup != null && entity.resolveDexCache) {
             SandHookMethodResolver.resolveMethod(hook, backup);
         }
         if (target instanceof Method) {
             ((Method)target).setAccessible(true);
         }
-        boolean res = hookMethod(target, hook, backup);
-        if (res && backup != null) {
+
+        int mode = HookMode.AUTO;
+        if (hookModeCallBack != null) {
+            mode = hookModeCallBack.hookMode(target);
+        }
+
+        int res;
+        if (mode != HookMode.AUTO) {
+            res = hookMethod(target, hook, backup, mode);
+        } else {
+            HookMode hookMode = hook.getAnnotation(HookMode.class);
+            res = hookMethod(target, hook, backup, hookMode == null ? HookMode.AUTO : hookMode.value());
+        }
+
+        if (res > 0 && backup != null) {
             backup.setAccessible(true);
         }
-        return res;
+
+        entity.hookMode = res;
+
+        if (hookResultCallBack != null) {
+            hookResultCallBack.hookResult(res > 0, entity);
+        }
+
+        if (res < 0) {
+            throw new HookErrorException("hook method <" + entity.target.toString() + "> error in native!");
+        }
+
+        globalHookEntityMap.put(entity.target, entity);
+
+        if (entity.backup != null) {
+            globalBackupMap.put(entity.backup, entity);
+        }
+
+        Log.d("SandHook", "method <" + entity.target.toString() + "> hook <" + (res == HookMode.INLINE ? "inline" : "replacement") + "> success!");
     }
 
-    private static void resolveStaticMethod(Member method) {
+    public static Object callOriginMethod(Member originMethod, Object thiz, Object... args) throws Throwable {
+        HookWrapper.HookEntity hookEntity = globalHookEntityMap.get(originMethod);
+        if (hookEntity == null || hookEntity.backup == null)
+            return null;
+        return callOriginMethod(originMethod, hookEntity.backup, thiz, args);
+    }
+
+    public static Object callOriginByBackup(Method backupMethod, Object thiz, Object... args) throws Throwable {
+        HookWrapper.HookEntity hookEntity = globalBackupMap.get(backupMethod);
+        if (hookEntity == null)
+            return null;
+        return callOriginMethod(hookEntity.target, backupMethod, thiz, args);
+    }
+
+    public static Object callOriginMethod(Member originMethod, Method backupMethod, Object thiz, Object[] args) throws Throwable {
+        backupMethod.setAccessible(true);
+        if (Modifier.isStatic(originMethod.getModifiers())) {
+            ensureMethodDeclaringClass(originMethod, backupMethod);
+            return backupMethod.invoke(null, args);
+        } else {
+            ensureMethodDeclaringClass(originMethod, backupMethod);
+            return backupMethod.invoke(thiz, args);
+        }
+    }
+
+    public static void ensureBackupDeclaringClass(Method backupMethod) {
+        if (backupMethod == null)
+            return;
+        HookWrapper.HookEntity hookEntity = globalBackupMap.get(backupMethod);
+        if (hookEntity == null)
+            return;
+        ensureMethodDeclaringClass(hookEntity.target, backupMethod);
+    }
+
+    public static void ensureBackupDelaringClassByOrigin(Member originMethod) {
+        if (originMethod == null)
+            return;
+        HookWrapper.HookEntity hookEntity = globalHookEntityMap.get(originMethod);
+        if (hookEntity == null || hookEntity.backup == null)
+            return;
+        ensureMethodDeclaringClass(originMethod, hookEntity.backup);
+    }
+
+
+
+    public static void resolveStaticMethod(Member method) {
         //ignore result, just call to trigger resolve
+        if (method == null)
+            return;
         try {
             if (method instanceof Method && Modifier.isStatic(method.getModifiers())) {
                 ((Method) method).setAccessible(true);
-                ((Method) method).invoke(new Object());
+                ((Method) method).invoke(new Object(), getFakeArgs((Method) method));
             }
-        } catch (Exception e) {
+        } catch (Throwable throwable) {
         }
+    }
+
+    private static Object[] getFakeArgs(Method method) {
+        Class[] pars = method.getParameterTypes();
+        if (pars == null || pars.length == 0) {
+            return new Object[]{new Object()};
+        } else {
+            return null;
+        }
+    }
+
+    public static Object getObject(long address) {
+        long threadSelf = getThreadId();
+        if (address == 0 || threadSelf == 0)
+            return null;
+        return getObjectNative(threadSelf, address);
+    }
+
+    public static boolean canGetObjectAddress() {
+        return Unsafe.support();
+    }
+
+    public static long getObjectAddress(Object object) {
+        return Unsafe.getObjectAddress(object);
     }
 
     private static void initTestOffset() {
@@ -156,8 +294,35 @@ public class SandHook {
 
     private static native boolean initNative(int sdk);
 
-    private static native boolean hookMethod(Member originMethod, Method hookMethod, Method backupMethod);
+    public static native void setHookMode(int hookMode);
+
+    //default on!
+    public static native void setInlineSafeCheck(boolean check);
+    public static native void skipAllSafeCheck(boolean skip);
+
+    private static native int hookMethod(Member originMethod, Method hookMethod, Method backupMethod, int hookMode);
 
     public static native void ensureMethodCached(Method hook, Method backup);
+
+    public static native void ensureMethodDeclaringClass(Member originMethod, Method backupMethod);
+
+    public static native boolean compileMethod(Member member);
+
+    public static native boolean canGetObject();
+    public static native Object getObjectNative(long thread, long address);
+
+    public static native boolean is64Bit();
+
+    public static native boolean disableVMInline();
+
+    @FunctionalInterface
+    public interface HookModeCallBack {
+        int hookMode(Member originMethod);
+    }
+
+    @FunctionalInterface
+    public interface HookResultCallBack {
+        void hookResult(boolean success, HookWrapper.HookEntity hookEntity);
+    }
 
 }

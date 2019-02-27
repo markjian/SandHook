@@ -11,18 +11,27 @@ cmake_minimum_required(VERSION 3.4.1)
 # Gradle automatically packages shared libraries with your APK.
 
 add_library( # Sets the name of the library.
-             native-lib
+             sandhook
 
              # Sets the library as a shared library.
              SHARED
 
              # Provides a relative path to your source file(s).
-             src/main/cpp/native-lib.cpp
+             src/main/cpp/sandhook.cpp
              src/main/cpp/trampoline/trampoline.cpp
              src/main/cpp/trampoline/trampoline_manager.cpp
-             src/main/cpp/utils/fake_dlfcn.cpp
+             src/main/cpp/utils/dlfcn_nougat.cpp
+             src/main/cpp/utils/hide_api.cpp
+             src/main/cpp/utils/utils.cpp
+             src/main/cpp/utils/offset.cpp
+             src/main/cpp/casts/cast_art_method.cpp
+             src/main/cpp/casts/cast_compiler_options.cpp
+             src/main/cpp/art/art_method.cpp
+             src/main/cpp/art/art_compiler_options.cpp
              src/main/cpp/trampoline/arch/arm32.S
              src/main/cpp/trampoline/arch/arm64.S
+             src/main/cpp/inst/insts_arm32.cpp
+             src/main/cpp/inst/insts_arm64.cpp
             )
 
 # Searches for a specified prebuilt library and stores the path as a
@@ -43,7 +52,7 @@ find_library( # Sets the name of the path variable.
 # build script, prebuilt third-party libraries, or system libraries.
 
 target_link_libraries( # Specifies the target library.
-                       native-lib
+                       sandhook
 
                        # Links the target library to the log library
                        # included in the NDK.
